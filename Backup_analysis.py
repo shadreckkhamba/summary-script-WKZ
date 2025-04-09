@@ -16,12 +16,15 @@ DB_PASSWORD = "password"
 TEMP_DB = "billing_analysis"
 BACKUP_DIR = "/home/shadreck/Documents/backup"
 
-# Detect the latest .gz backup file
+current_date = datetime.now()
+start_date = current_date - timedelta(days=30)
+start_date_str = start_date.strftime('%Y-%m-%d')
+end_date_str = current_date.strftime('%Y-%m-%d')
+
 backup_files = sorted([f for f in os.listdir(BACKUP_DIR) if f.endswith(".sql.gz")], reverse=True)
 if not backup_files:
     print("No backup files found.")
     exit(1)
-
 backup_file = os.path.join(BACKUP_DIR, backup_files[0])
 print(f"Using backup file: {backup_file}")
 
@@ -32,15 +35,12 @@ with gzip.open(backup_file, 'rb') as f_in:
         shutil.copyfileobj(f_in, f_out)
 print(f"Extracted SQL file: {temp_sql_file}")
 
-# Connect to MySQL and create temporary database
 conn = mysql.connector.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD)
 cursor = conn.cursor()
 cursor.execute(f"DROP DATABASE IF EXISTS {TEMP_DB}")
 cursor.execute(f"CREATE DATABASE {TEMP_DB}")
 cursor.close()
 conn.close()
-
-# Load the extracted SQL file into the temp database
 os.system(f"mysql -u {DB_USER} -p{DB_PASSWORD} {TEMP_DB} < {temp_sql_file}")
 print("Database restored successfully.")
 
@@ -74,6 +74,27 @@ SELECT
 cursor.execute(registered_patients_query)
 this_year, this_month, this_week, today = cursor.fetchone()
 
+# Paying vs Non-Paying Query
+paying_query = """
+SELECT 
+    COUNT(*) AS total_patients,
+    SUM(CASE WHEN paying_orders > 0 AND non_paying_orders = 0 THEN 1 ELSE 0 END) AS exclusively_paying,
+    SUM(CASE WHEN non_paying_orders > 0 AND paying_orders = 0 THEN 1 ELSE 0 END) AS exclusively_non_paying,
+    SUM(CASE WHEN paying_orders > 0 AND non_paying_orders > 0 THEN 1 ELSE 0 END) AS both_categories
+FROM (
+    SELECT 
+        patient_id,
+        SUM(CASE WHEN full_price >= 1000 THEN 1 ELSE 0 END) AS paying_orders,
+        SUM(CASE WHEN full_price = 0 THEN 1 ELSE 0 END) AS non_paying_orders
+    FROM order_entries
+    WHERE order_date BETWEEN %s AND %s
+    GROUP BY patient_id
+) AS patient_summary;
+"""
+cursor.execute(paying_query, (f"{start_date_str} 00:00:00", f"{end_date_str} 23:59:59"))
+total, paying, non_paying, both = cursor.fetchone()
+
+# Combine the first part only in DataFrame
 registered_patients_df = pd.DataFrame({
     "Metric": ["Registered This Year", "Registered This Month", "Registered This Week", "Registered Today"],
     "Count": [this_year, this_month, this_week, today]
@@ -110,8 +131,6 @@ total_overdue = order_entries_df["Total Amount Overdue"].sum()
 total_patients_balance = order_entries_df["Patients With Outstanding Balance"].sum()
 
 totals_df = pd.DataFrame([{
-    "Service Name": "All Services:",
-    "Total Quantity": total_quantity,
     "Total Amount Paid": total_amount_collected,
     "Expected Total Amount Paid": total_expected,
     "Patients With Outstanding Balance": total_patients_balance,
@@ -124,7 +143,7 @@ for col in ["Total Amount Paid", "Expected Total Amount Paid", "Total Amount Ove
     order_entries_df[col] = order_entries_df[col].apply(lambda x: f"MWK {x:,.2f}" if isinstance(x, (int, float)) else x)
 
 
-# 3. Patient Age Group Analysis (Adolescence-focused)
+# 3. Patient Age Groups
 age_group_query = """
 SELECT age_group, 
        gender,
@@ -155,7 +174,7 @@ age_group_df["Age Group"] = pd.Categorical(age_group_df["Age Group"], categories
 age_group_df = age_group_df.sort_values(["Age Group", "Gender"])
 
 
-# 4. Most Profitable Services Per Age Group
+# 4. Services Used Per Age Group
 most_profitable_services_query = """
     SELECT 
         CASE 
@@ -221,43 +240,14 @@ services_used_results = cursor.fetchall()
 services_used_results = [
     (service_name, year, calendar.month_name[month], services_used) 
     for service_name, year, month, services_used in services_used_results
-]
-
+    ]
 services_used_df = pd.DataFrame(services_used_results, columns=["Service Name", "Year", "Month", "Services Used Per Month"])
 services_used_df["Month_num"] = services_used_df["Month"].map({month: idx for idx, month in enumerate(calendar.month_name) if month})
 services_used_df.sort_values(by=["Year", "Month_num"], ascending=[False, False], inplace=True)
 services_used_df.drop("Month_num", axis=1, inplace=True)
 
-# 7. Drugs Overview Report
-drugs_overview_query = """
-    SELECT
-        d.name AS drug_name,
-        cn.name AS dosage_form_name,
-        COUNT(d.drug_id) AS drug_count,
-        AVG(d.dose_strength) AS avg_dose_strength
-    FROM drug d
-    JOIN concept_name cn ON d.dosage_form = cn.concept_id 
-        AND cn.locale = 'en' 
-        AND cn.concept_name_type = 'FULLY_SPECIFIED'
-    GROUP BY d.name, cn.name;
-"""
-cursor.execute(drugs_overview_query)
-drugs_overview_results = cursor.fetchall()
 
-drugs_overview_df = pd.DataFrame(drugs_overview_results, columns=[
-    "Drug Name", "Dosage Form", "Drug Count", "Avg Dose Strength"
-])
-drugs_overview_df.sort_values(by=["Drug Name", "Dosage Form"], inplace=True)
-drugs_overview_df["Drug Count"] = drugs_overview_df["Drug Count"].apply(lambda x: f"{int(x)}")
-drugs_overview_df["Avg Dose Strength"] = drugs_overview_df["Avg Dose Strength"].apply(lambda x: f"{x:.2f}")
-
-
-#8. Get distribution of returning patients
-current_date = datetime.now()
-start_date = current_date - timedelta(days=30)
-start_date_str = start_date.strftime('%Y-%m-%d')
-end_date_str = current_date.strftime('%Y-%m-%d')
-
+#7. Get distribution of returning patients
 returning_patients_query = f"""
 SELECT COUNT(*) 
 FROM (
@@ -271,7 +261,7 @@ FROM (
 cursor.execute(returning_patients_query)
 returning_patients_count = cursor.fetchone()[0]
 
-# Patient distribution based on age and gender
+#8 Patient distribution based on age and gender
 returning_patients_distribution_query = f"""
 SELECT 
     CASE 
@@ -304,7 +294,6 @@ for _ in range(1):
 
 order_entries_df = pd.concat([order_entries_df, pd.DataFrame([{
     "Service Name": "",
-    "  Total Quantity   ": "",
     "Total Amount Paid": "",
     "Expected Total Amount Paid": "",
     "Patients With Outstanding Balance": ""
@@ -314,7 +303,6 @@ distribution_data = []
 for age_category, gender, count in returning_patients_results:
     distribution_data.append({
         "Service Name": "",
-        "  Total Quantity   ": "",
         "Total Amount Paid": "",
         "Expected Total Amount Paid": "",
         "Patients With Outstanding Balance": ""
@@ -343,12 +331,75 @@ ORDER BY visit_count;
 cursor.execute(returning_patients_frequency_query)
 returning_patients_freq_results = cursor.fetchall()
 
+#9. SQL query for the trend of money made per day
+trend_query = f"""
+SELECT 
+    DATE(created_at) AS transaction_date,
+    SUM(full_price) AS total_collected
+FROM order_entries
+WHERE cashier IN ('1','8', '9')
+AND created_at BETWEEN '{start_date_str} 00:00:00' AND '{end_date_str} 23:59:59'
+GROUP BY transaction_date
+ORDER BY transaction_date;
+"""
+cursor.execute(trend_query)
+result = cursor.fetchall()
+if result:
+    trend_df = pd.DataFrame(result)
+    trend_df.columns = ["Transaction Date", "Total Collected"]
+    trend_df["Transaction Date"] = pd.to_datetime(trend_df["Transaction Date"])
+    trend_df["Total Collected"] = trend_df["Total Collected"].apply(
+        lambda x: f"MWK {x:,.2f}" if isinstance(x, (int, float)) else x
+    )
+    trend_df["Transaction Date"] = trend_df["Transaction Date"].dt.strftime("%Y-%m-%d")
+else:
+    trend_df = pd.DataFrame(columns=["Transaction Date", "Total Collected"])
 
-# Close database connection
+
+#10. SQL query for Daily Hospital Patient Visits
+hospital_visits_query = f"""
+SELECT
+    daily_registrations.registration_date,
+    daily_registrations.total_registrations,
+    COALESCE(daily_returning.total_returning_patients, 0) AS total_returning_patients,
+    daily_registrations.total_registrations + COALESCE(daily_returning.total_returning_patients, 0) AS total_visits
+FROM (
+    SELECT DATE(date_created) AS registration_date, COUNT(*) AS total_registrations
+    FROM patient
+    WHERE date_created BETWEEN '{start_date_str} 00:00:00' AND '{end_date_str} 23:59:59'
+    GROUP BY registration_date
+) AS daily_registrations
+LEFT JOIN (
+    SELECT
+        visit_date,
+        COUNT(patient_id) AS total_returning_patients
+    FROM (
+        SELECT
+            DATE(payment_stamp) AS visit_date,
+            patient_id,
+            COUNT(*) AS visit_count
+        FROM receipts
+        WHERE payment_stamp BETWEEN '{start_date_str} 00:00:00' AND '{end_date_str} 23:59:59'
+        GROUP BY visit_date, patient_id
+        HAVING COUNT(*) > 1
+    ) AS daily_returning
+    GROUP BY visit_date
+) AS daily_returning ON daily_registrations.registration_date = daily_returning.visit_date
+ORDER BY daily_registrations.registration_date;
+"""
+cursor.execute(hospital_visits_query)
+result = cursor.fetchall()
+if result:
+    hospital_visits_df = pd.DataFrame(result)
+    hospital_visits_df.columns = ["Registration Date", "Total Registrations", "Total Returning Patients", "Total Visits"]
+    hospital_visits_df["Registration Date"] = pd.to_datetime(hospital_visits_df["Registration Date"])
+    hospital_visits_df["Registration Date"] = hospital_visits_df["Registration Date"].dt.strftime("%Y-%m-%d")
+else:
+    hospital_visits_df = pd.DataFrame(columns=["Registration Date", "Total Registrations", "Total Returning Patients", "Total Visits"])
+
 cursor.close()
 conn.close()
 
-# Consolidate all DataFrames into one Excel file
 consolidated_file = os.path.join(BACKUP_DIR, "Consolidated_Report.xlsx")
 with pd.ExcelWriter(consolidated_file, engine='openpyxl') as writer:
     registered_patients_df.to_excel(writer, sheet_name="Registered Patients", index=False)
@@ -357,9 +408,34 @@ with pd.ExcelWriter(consolidated_file, engine='openpyxl') as writer:
     most_profitable_services_df.to_excel(writer, sheet_name="Service Profits By Age Group", index=False)
     most_popular_services_df.to_excel(writer, sheet_name="Popular Services", index=False)
     services_used_df.to_excel(writer, sheet_name="Services Used Per Month", index=False)
-    drugs_overview_df.to_excel(writer, sheet_name="Drugs Overview", index=False)
+    trend_df.to_excel(writer, sheet_name="Daily Money Trend", index=False)
+    hospital_visits_df.to_excel(writer, sheet_name="Daily Hospital Patient Visits", index=False)
+pdf_file = os.path.join(BACKUP_DIR, "Consolidated_Report.pdf")
 
 wb = load_workbook(consolidated_file)
+ws = wb["Registered Patients"]
+
+right_title = "Paying vs. Non-Paying Patients"
+right_data = [
+    ("Total Patients", total),
+    ("Exclusively Paying Patients", paying),
+    ("Exclusively Non-Paying Patients", non_paying),
+    ("Patients in Both Categories", both)
+]
+
+start_col = 4 
+start_row = 1
+ws.cell(row=start_row, column=start_col).value = right_title
+ws.cell(row=start_row, column=start_col).font = Font(bold=True)
+
+for i, (label, count) in enumerate(right_data, start=1):
+    ws.cell(row=start_row + i, column=start_col).value = label
+    ws.cell(row=start_row + i, column=start_col + 1).value = count
+
+ws.column_dimensions[get_column_letter(start_col)].width = 35
+ws.column_dimensions[get_column_letter(start_col + 1)].width = 15
+
+wb.save(consolidated_file)
 
 for sheet_name in wb.sheetnames:
     ws = wb[sheet_name]
@@ -387,7 +463,6 @@ for sheet_name in wb.sheetnames:
         ws[f"A{returning_patients_row}"] = f"Returning Patients Distribution · {start_date_str} to {end_date_str}"
         ws.row_dimensions[returning_patients_row].height = 30
 
-        # Distribution and Count headers
         ws[f"A{returning_patients_row + 1}"] = "Distribution"
         ws[f"B{returning_patients_row + 1}"] = "Count"
         ws[f"C{returning_patients_row + 1}"] = "Total Patients"
@@ -398,7 +473,6 @@ for sheet_name in wb.sheetnames:
         ws[f"B{returning_patients_row + 1}"].font = Font(bold=True)
         ws[f"C{returning_patients_row + 1}"].font = Font(bold=True)
 
-        # Insert the distribution data
         total_returning_patients = 0
         for idx, (age_category, gender, count) in enumerate(returning_patients_results, start=returning_patients_row + 2):
             ws[f"A{idx}"] = f"{age_category} ({gender})"
@@ -414,7 +488,6 @@ for sheet_name in wb.sheetnames:
         ws[f"C{total_row}"].alignment = Alignment(horizontal="center", vertical="center")
         ws[f"C{total_row}"].font = Font(bold=True)
 
-        # Frequency of Returning Patients section
         frequency_title_row = total_row + 2
         ws.merge_cells(start_row=frequency_title_row, start_column=1, end_row=frequency_title_row, end_column=3)
         ws[f"A{frequency_title_row}"] = "Frequency of The Returning Patients"
@@ -422,7 +495,6 @@ for sheet_name in wb.sheetnames:
         ws[f"A{frequency_title_row}"].alignment = Alignment(horizontal="left", vertical="center")
         ws.row_dimensions[frequency_title_row].height = 30
 
-        # Frequency table headers
         freq_header_row = frequency_title_row + 1
         ws[f"A{freq_header_row}"] = "Number of Visits"
         ws[f"B{freq_header_row}"] = "Number of Patients"
@@ -433,7 +505,6 @@ for sheet_name in wb.sheetnames:
         ws[f"B{freq_header_row}"].alignment = Alignment(horizontal="center", vertical="center")
         ws[f"C{freq_header_row}"].alignment = Alignment(horizontal="center", vertical="center")
 
-        # Only insert the visits + patient count, and sum for column C
         total_patients_with_more_visits = 0
         for idx_offset, (visits, patient_count) in enumerate(returning_patients_freq_results):
             row = freq_header_row + 1 + idx_offset
@@ -443,7 +514,6 @@ for sheet_name in wb.sheetnames:
             ws[f"B{row}"].alignment = Alignment(horizontal="center", vertical="center")
             total_patients_with_more_visits += patient_count
 
-        # Insert only total at the bottom of column C
         final_freq_row = freq_header_row + 1 + len(returning_patients_freq_results)
         ws[f"C{final_freq_row}"] = total_patients_with_more_visits
         ws[f"C{final_freq_row}"].alignment = Alignment(horizontal="center", vertical="center")
@@ -452,7 +522,6 @@ for sheet_name in wb.sheetnames:
     ws.protection.sheet = True
     ws.protection.password = 'ghii@wkz'
 
-# Save the modified workbook
 wb.save(consolidated_file)
 print(f"Consolidated report saved: {consolidated_file}")
 
