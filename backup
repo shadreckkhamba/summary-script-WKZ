@@ -1,0 +1,86 @@
+#!/bin/bash
+
+# Variables
+LOCAL_SERVER="shadreck@192.168.10.118"
+LAB_SERVER="ghii@192.168.10.186"
+DB_NAME="billing_prod_import"
+DB_USER="root"
+DB_PASSWORD="password"
+LOCAL_BACKUP_DIR="/home/shadreck/Documents/backup"
+REMOTE_BACKUP_DIR="/home/ghii/tests/backup"
+DAY_OF_WEEK=$(date +%A)
+FINAL_FILE="$LOCAL_BACKUP_DIR/${DB_NAME}_backup_${DAY_OF_WEEK}.sql.gz"
+EXTRACTED_FILE="$LOCAL_BACKUP_DIR/${DB_NAME}_backup_${DAY_OF_WEEK}.sql"
+LOG_FILE="$LOCAL_BACKUP_DIR/backup_logs.log"
+
+# Redirect all output to the log file
+exec >> "$LOG_FILE" 2>&1
+
+echo "START BACKUP $(date)"
+
+# Ensure required commands exist
+if ! command -v mysqldump &> /dev/null; then
+  echo "Error: mysqldump command not found. Please install MySQL client tools." >&2
+  exit 1
+fi
+
+# Ensure the local backup directory exists
+if ! mkdir -p "$LOCAL_BACKUP_DIR"; then
+  echo "Error: Could not create local backup directory $LOCAL_BACKUP_DIR" >&2
+  exit 1
+fi
+
+# Perform the database dump locally and compress it
+echo "Creating database backup..."
+mysqldump -u "$DB_USER" -p"$DB_PASSWORD" "$DB_NAME" | gzip > "$FINAL_FILE"
+DUMP_EXIT=$?
+
+if [ $DUMP_EXIT -ne 0 ]; then
+  echo "Backup failed with exit code $DUMP_EXIT" >&2
+  exit $DUMP_EXIT
+fi
+
+echo "Backup successful: $FINAL_FILE"
+
+# Extract the backup file locally
+echo "Extracting the backup..."
+if ! gunzip -c "$FINAL_FILE" > "$EXTRACTED_FILE"; then
+  echo "Backup extraction failed." >&2
+  exit 1
+fi
+
+echo "Backup extracted successfully: $EXTRACTED_FILE"
+
+# Ensure the remote backup directory exists on the LAB server
+echo "Ensuring backup directory exists on the LAB server..."
+ssh "$LAB_SERVER" "mkdir -p $REMOTE_BACKUP_DIR"
+SSH_EXIT=$?
+
+if [ $SSH_EXIT -ne 0 ]; then
+  echo "Error: Could not create remote backup directory on $LAB_SERVER" >&2
+  exit $SSH_EXIT
+fi
+
+# Verify extracted file exists before transferring
+if [ ! -f "$EXTRACTED_FILE" ]; then
+  echo "Error: Extracted backup file not found. Transfer aborted." >&2
+  exit 1
+fi
+
+# Transfer the extracted backup to the LAB server
+echo "Transferring extracted backup to lab server..."
+scp "$EXTRACTED_FILE" "$LAB_SERVER:$REMOTE_BACKUP_DIR/"
+SCP_EXIT=$?
+
+if [ $SCP_EXIT -ne 0 ]; then
+  echo "Backup transfer failed with exit code $SCP_EXIT" >&2
+  exit $SCP_EXIT
+fi
+
+echo "Extracted backup successfully transferred to $LAB_SERVER:$REMOTE_BACKUP_DIR"
+
+# Clean up: Remove the extracted file after transfer
+rm -f "$EXTRACTED_FILE"
+echo "Extracted backup file removed from local server."
+
+echo "END BACKUP $(date)"
